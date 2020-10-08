@@ -74,7 +74,7 @@ class CallPaths():
     """
     
     @staticmethod
-    def _make_node(name, row, parent_node, roots, nodes):
+    def _make_node(name, row, parent_node, roots, nodes, include_groups):
         """creates a node in the callpath tree"""
         if parent_node:
             key = f"{name}:{parent_node.get_name()}"
@@ -88,9 +88,11 @@ class CallPaths():
             "time": row['Exclusive'],
             "time (inc)": row['Inclusive'],
             "calls": row['Calls'],
-            "subcalls": row['Subcalls'],
-            "groups": row['Group'][7:-1] #getting rid of the 'Group="' and the '"' at the beginning and end of Group string
+            "subcalls": row['Subcalls']
         }
+
+        if include_groups:
+            metrics["groups"] = row['Group'][7:-1] #getting rid of the 'Group="' and the '"' at the beginning and end of Group string
 
         node = InnerNode(name, **metrics)  
         if parent_node is not None:
@@ -122,7 +124,7 @@ class CallPaths():
             return row.loc[np.nan]
     
     @staticmethod
-    def _recursive_constructor(call_path_data, non_call_path_data, level, parent_node, roots, nodes, depth, drop_context):
+    def _recursive_constructor(call_path_data, non_call_path_data, level, parent_node, roots, nodes, depth, drop_context, include_groups):
         """recursively builds the tree"""
         if level == depth:
             return
@@ -132,30 +134,30 @@ class CallPaths():
             if CallPaths._is_node_leaf(call_path_data, func, level, depth):
                 row = call_path_data.loc[func]
                 if type(row) == pd.core.frame.DataFrame: # when it's not a Series, there are still more levels
-                    node = CallPaths._make_node(func, CallPaths._get_last_null_index(row), parent_node, roots, nodes)
-                    CallPaths._recursive_constructor(row, non_call_path_data, level + 1, node, roots, nodes, depth,drop_context)
+                    node = CallPaths._make_node(func, CallPaths._get_last_null_index(row), parent_node, roots, nodes, include_groups)
+                    CallPaths._recursive_constructor(row, non_call_path_data, level + 1, node, roots, nodes, depth,drop_context, include_groups)
                 else:
-                    node = CallPaths._make_node(func, row, parent_node, roots, nodes)
+                    node = CallPaths._make_node(func, row, parent_node, roots, nodes, include_groups)
             else:
                 row = call_path_data.loc[func]
                 if drop_context and "[CONTEXT]" in func:
                     node = parent_node
                 else:
                     try:
-                        node = CallPaths._make_node(func, CallPaths._get_last_null_index(row), parent_node, roots, nodes)
+                        node = CallPaths._make_node(func, CallPaths._get_last_null_index(row), parent_node, roots, nodes, include_groups)
                     except KeyError:
                         # can't make node, we don't have info for it's timer, 
                         # paraprof uses the flat profile in this case
-                        node = CallPaths._make_node(func, non_call_path_data.loc[func], parent_node, roots, nodes)
+                        node = CallPaths._make_node(func, non_call_path_data.loc[func], parent_node, roots, nodes, include_groups)
                 
-                CallPaths._recursive_constructor(call_path_data.loc[func], non_call_path_data, level + 1, node, roots, nodes, depth, drop_context)
+                CallPaths._recursive_constructor(call_path_data.loc[func], non_call_path_data, level + 1, node, roots, nodes, depth, drop_context, include_groups)
     
     @staticmethod
-    def _construct(call_path_data, non_call_path_data, drop_context):
+    def _construct(call_path_data, non_call_path_data, drop_context, include_groups):
         depth = len(call_path_data.index.levshape)
         nodes = dict()
         roots = []
-        CallPaths._recursive_constructor(call_path_data, non_call_path_data, 0, None, roots, nodes, depth, drop_context)
+        CallPaths._recursive_constructor(call_path_data, non_call_path_data, 0, None, roots, nodes, depth, drop_context, include_groups)
         roots = [root.to_dict() for root in roots]
         return CallPaths(roots, call_path_data, non_call_path_data, depth)
         
@@ -189,6 +191,7 @@ class CallPaths():
         
     def get_exclusives_per_call_roots(self):
         """
+        creates a new CallPath object where the exclusives are computed per call
         """
         def action(node):
             node['metrics']['time'] /= node['metrics']['calls']
@@ -199,9 +202,18 @@ class CallPaths():
         return self.apply_action_on_roots(action)
     
     def to_hatchet(self):
+        """
+        creates a hatchet graphframe
+        """
         return ht.GraphFrame.from_literal(self._roots)
     
-    def to_sunburst_chart(self, by, top_n=10):
+    def to_sunburst_chart(self, by):
+        """
+        generates a plotly sunburst chart
+        """
+
+        # TODO: in large call graphs this will be very inefficient
+        #       add mechanism to filter the calls
         
         # values to be filled and passed to plotly
         parents = []
@@ -229,56 +241,6 @@ class CallPaths():
         fig.show()
 
     @staticmethod
-    def to_heat_map(data, metric_name, node, context, threads='all', drop_context=True):
-        """Available metric_names: 'Exclusive', 'Inclusive', 'Calls', 'Subcalls' """
-        
-        import plotly.graph_objs as go
-        import plotly as py
-        import plotly.express as px
-        def get_common_calls_amongst_threads(data, col_name, node, context, threads):
-            """
-            creates and returns a dataframe containing the `top_n` `col_name` column of the `data` DataFrame
-            """
-            
-            df = None
-            cntr = 0
-            first = True
-            for thread in threads:
-                tmp = data.loc[node, context, thread][[col_name]] 
-                tmp = tmp.sort_values(by=[col_name], ascending=False)  
-                if first: 
-                    df = tmp
-                else: 
-                    df = df.merge(tmp, how='inner', on=['Timer'], suffixes=(f"_{str(cntr)}", f"_{str(cntr + 1)}"))
-                    cntr += 1
-                first = False
-                
-            return df
-
-        def create_heat_map_data(data): 
-            """Creates a 2d list which is the `heat` data needed for the heat map"""
-            heat_map_data = []
-            for r in data.iterrows():
-                row = [i for i in r[1]]
-                heat_map_data.append(row)
-            return heat_map_data
-        
-        if threads == 'all':
-            threads = [i for i in range(len(data.groupby(level=2)))]
-        if drop_context:
-            data = data[~data['Group'].str.contains('TAU_SAMPLE_CONTEXT')]
-        thread_labels = [f"thrd_{str(t)}" for t in threads]
-        data= get_common_calls_amongst_threads(data, metric_name, node, context, threads)
-        function_labels = [f for f in data.index]
-        heat_map_data = create_heat_map_data(data)
-        fig = go.Figure(data=go.Heatmap(
-                        z=heat_map_data,
-                        x=thread_labels,
-                        y=function_labels
-                    ))
-        fig.show()
-
-    @staticmethod
     def _categorize_data(data, node, context, thread):
         """extracts callpath data from tau profile data `data`"""
         data = data.loc[node, context, thread]
@@ -289,7 +251,7 @@ class CallPaths():
         return data1, data2
 
     @staticmethod
-    def from_tau_interval_profile(tau_interval, node, context, thread, drop_context=True):
+    def from_tau_interval_profile(tau_interval, node, context, thread, drop_context=True, include_groups=True):
         """
         Creates and returns a CallPath object
         
@@ -297,10 +259,63 @@ class CallPaths():
         node: int
         contex: int
         thread: int
+        drop_context: bool; drops the `[CONTEXT]` nodes
+        include_groups: bool; includes the `GROUP` metric when constructing graphs
+                        note: if this is true, since groups are of str type, hatchet can't
+                        compute the inclusives
         """
         if drop_context:
             tau_interval = tau_interval[~tau_interval['Group'].str.contains('TAU_SAMPLE_CONTEXT')]
             
         call_path_data, non_call_path_data = CallPaths._categorize_data(tau_interval, node, context, thread)
-        return CallPaths._construct(call_path_data, non_call_path_data, drop_context)
+        return CallPaths._construct(call_path_data, non_call_path_data, drop_context, include_groups)
+
+def tau_to_heat_map(data, metric_name, node, context, threads='all', drop_context=True):
+    """Available metric_names: 'Exclusive', 'Inclusive', 'Calls', 'Subcalls' """
+    
+    import plotly.graph_objs as go
+    import plotly as py
+    import plotly.express as px
+    def get_common_calls_amongst_threads(data, col_name, node, context, threads):
+        """
+        creates and returns a dataframe containing the `top_n` `col_name` column of the `data` DataFrame
+        """
+        
+        df = None
+        cntr = 0
+        first = True
+        for thread in threads:
+            tmp = data.loc[node, context, thread][[col_name]] 
+            tmp = tmp.sort_values(by=[col_name], ascending=False)  
+            if first: 
+                df = tmp
+            else: 
+                df = df.merge(tmp, how='inner', on=['Timer'], suffixes=(f"_{str(cntr)}", f"_{str(cntr + 1)}"))
+                cntr += 1
+            first = False
+            
+        return df
+
+    def create_heat_map_data(data): 
+        """Creates a 2d list which is the `heat` data needed for the heat map"""
+        heat_map_data = []
+        for r in data.iterrows():
+            row = [i for i in r[1]]
+            heat_map_data.append(row)
+        return heat_map_data
+    
+    if threads == 'all':
+        threads = [i for i in range(len(data.groupby(level=2)))]
+    if drop_context:
+        data = data[~data['Group'].str.contains('TAU_SAMPLE_CONTEXT')]
+    thread_labels = [f"thrd_{str(t)}" for t in threads]
+    data= get_common_calls_amongst_threads(data, metric_name, node, context, threads)
+    function_labels = [f for f in data.index]
+    heat_map_data = create_heat_map_data(data)
+    fig = go.Figure(data=go.Heatmap(
+                    z=heat_map_data,
+                    x=thread_labels,
+                    y=function_labels
+                ))
+    fig.show()
         
